@@ -1,0 +1,15 @@
+# Build trees
+/build/
+/out/
+/cmake-build-*/
+
+# Editor and tooling state
+/.vs/
+/.vscode/
+/.cache/
+compile_commands.json
+
+# Local run artefacts
+*.log
+*.tmp
+/tmp/
