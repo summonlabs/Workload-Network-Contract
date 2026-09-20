@@ -1014,12 +1014,18 @@ ContractDecodeResult contract_from_json(const Json& value, const JsonDecodeOptio
       return result;
     }
     const Digest computed = body_digest(contract.body);
-    if (*parsed != computed) {
+    if (*parsed == Digest{}) {
+      // A zero digest means "not yet derived": the author wrote a body and the
+      // envelope has not been sealed. The digest is derived from the content
+      // instead, exactly as the contract identity is.
+      contract.digest = computed;
+    } else if (*parsed != computed) {
       result.code = Code::kContractDigestMismatch;
       result.message = "declared digest does not match the canonical body bytes";
       return result;
+    } else {
+      contract.digest = *parsed;
     }
-    contract.digest = *parsed;
   } else {
     contract.digest = body_digest(contract.body);
   }
@@ -1369,10 +1375,17 @@ ValidationResult validate_contract(const Contract& contract, const JsonDecodeOpt
     result.diagnostics.add(Code::kContractDigestMismatch,
                            "contract digest does not match the canonical body bytes");
   }
-  const ContractId derived = derive_contract_id(contract.body.workload.id, computed);
-  if (derived != contract.body.contract_id) {
-    result.diagnostics.add(Code::kContractDigestMismatch,
-                           "contract identity does not match the workload and body digest");
+  if (contract.body.contract_id.is_zero()) {
+    // A body with no identity is a fragment, not a contract: it is publishable
+    // only after canonicalising, which derives the identity from the content.
+    result.diagnostics.add(Code::kZeroIdentity,
+                           "contract identity is not set; canonicalise the body first");
+  } else {
+    const ContractId derived = derive_contract_id(contract.body.workload.id, computed);
+    if (derived != contract.body.contract_id) {
+      result.diagnostics.add(Code::kContractDigestMismatch,
+                             "contract identity does not match the workload and body digest");
+    }
   }
   if (contract.has_supersedes()) {
     if (contract.supersedes.value >= contract.body.generation.value) {

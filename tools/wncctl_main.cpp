@@ -40,7 +40,8 @@ int usage() {
   std::fprintf(stderr,
                "usage: wncctl <command> [options]\n"
                "\n"
-               "  validate --contract <file> | --policy <file> | --evidence <file>\n"
+               "  seal     --body <file>          complete a body and print the contract\n"
+               "  validate --contract <file> | --body <file> | --policy <file> | --evidence <file>\n"
                "  digest   --contract <file>\n"
                "  explain  --contract <file> [--evidence <file>]\n"
                "  diff     --before <file> --after <file>\n"
@@ -93,7 +94,83 @@ void print_diagnostics(const DiagnosticLog& log) {
   }
 }
 
+// Reads a contract body on its own, completes it with the identity and digest
+// that follow from its content, and prints the finished envelope. This is how a
+// contract is created: the author writes the requirements, never the identity.
+int command_seal(const std::string& path) {
+  std::string text;
+  if (!read_text_file(path, text)) {
+    return 2;
+  }
+  const JsonDecodeResult document = json_decode(text);
+  if (!document.ok) {
+    std::fprintf(stderr, "%s is not valid JSON: %s\n", path.c_str(), document.message.c_str());
+    return 1;
+  }
+  Json envelope;
+  if (document.value.find("body") != nullptr) {
+    envelope = document.value;
+  } else {
+    envelope.set("body", document.value);
+    envelope.set("digest", std::string(kSha256HexChars, '0'));
+  }
+  ContractDecodeResult decoded = contract_from_json(envelope);
+  if (!decoded.ok) {
+    std::fprintf(stderr, "body refused: %s: %s\n", std::string(code_token(decoded.code)).c_str(),
+                 decoded.message.c_str());
+    return 1;
+  }
+  // Canonicalising derives both the digest and the contract identity from the
+  // content, so the printed document is publishable as it stands.
+  (void)canonicalize(decoded.contract);
+  const ValidationResult validation = validate_contract(decoded.contract);
+  if (!validation.ok) {
+    std::fprintf(stderr, "body is not a valid contract:\n");
+    print_diagnostics(validation.diagnostics);
+    return 1;
+  }
+  std::printf("%s\n", contract_to_json(decoded.contract).dump().c_str());
+  std::fprintf(stderr, "workload=%s\n", decoded.contract.body.workload.id.str().c_str());
+  std::fprintf(stderr, "contract=%s\n", decoded.contract.body.contract_id.str().c_str());
+  std::fprintf(stderr, "digest=%s\n", hex_encode(decoded.contract.digest).c_str());
+  std::fprintf(stderr, "requirements=%zu\n", decoded.contract.body.requirements.size());
+  return 0;
+}
+
 int command_validate(int argc, char** argv) {
+  if (const std::optional<std::string> path = option(argc, argv, "--body")) {
+    std::string text;
+    if (!read_text_file(*path, text)) {
+      return 2;
+    }
+    const JsonDecodeResult document = json_decode(text);
+    if (!document.ok) {
+      std::fprintf(stderr, "%s is not valid JSON: %s\n", path->c_str(),
+                   document.message.c_str());
+      return 1;
+    }
+    Json envelope;
+    envelope.set("body", document.value.find("body") != nullptr ? *document.value.find("body")
+                                                                : document.value);
+    envelope.set("digest", std::string(kSha256HexChars, '0'));
+    ContractDecodeResult decoded = contract_from_json(envelope);
+    if (!decoded.ok) {
+      std::fprintf(stderr, "body refused: %s: %s\n",
+                   std::string(code_token(decoded.code)).c_str(), decoded.message.c_str());
+      return 1;
+    }
+    (void)canonicalize(decoded.contract);
+    const ValidationResult validation = validate_contract(decoded.contract);
+    if (!validation.ok) {
+      std::fprintf(stderr, "body is not a valid contract:\n");
+      print_diagnostics(validation.diagnostics);
+      return 1;
+    }
+    std::printf("body valid\n");
+    std::printf("digest=%s\n", hex_encode(decoded.contract.digest).c_str());
+    std::printf("contract=%s\n", decoded.contract.body.contract_id.str().c_str());
+    return 0;
+  }
   if (const std::optional<std::string> path = option(argc, argv, "--contract")) {
     std::string text;
     if (!read_text_file(*path, text)) {
@@ -406,7 +483,11 @@ int command_compose(int argc, char** argv) {
       std::fprintf(stderr, "layer %s must be a JSON object\n", layer_path.c_str());
       return 1;
     }
-    Json body_document = decoded.value;
+    // A layer may be written as a bare body or as a sealed contract envelope.
+    Json body_document =
+        decoded.value.find("body") != nullptr && decoded.value.find("body")->is_object()
+            ? *decoded.value.find("body")
+            : decoded.value;
     if (body_document.find("schema_version") == nullptr) {
       body_document.set("schema_version", static_cast<std::int64_t>(kSchemaVersion));
     }
@@ -580,6 +661,14 @@ int main(int argc, char** argv) {
   const std::string command = argv[1];
   if (command == "validate") {
     return command_validate(argc, argv);
+  }
+  if (command == "seal") {
+    const std::optional<std::string> path = option(argc, argv, "--body");
+    if (!path.has_value()) {
+      std::fprintf(stderr, "seal requires --body <file>\n");
+      return 2;
+    }
+    return command_seal(*path);
   }
   if (command == "digest") {
     return command_digest(argc, argv);
