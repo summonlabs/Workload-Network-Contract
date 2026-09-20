@@ -55,6 +55,18 @@ SignatureBytes signature_of(const ContractEnvelope& envelope) {
   return out;
 }
 
+// Decoding options for a durable record. A record is this runtime's own trusted
+// output, written under kMaxRecordBytes, so it is read back under the same
+// bound: any record that was accepted is a record that can be recovered. The
+// smaller document bound applies to documents arriving from outside instead.
+JsonDecodeOptions journal_decode_options() {
+  JsonDecodeOptions options;
+  options.max_bytes = kMaxRecordBytes;
+  options.max_depth = kMaxJsonDepth;
+  options.max_string_bytes = kMaxRecordBytes;
+  return options;
+}
+
 }  // namespace
 
 Runtime::~Runtime() = default;
@@ -131,11 +143,13 @@ std::optional<Runtime> Runtime::open(const Options& options, Code& code, std::st
   if (!runtime.ledger_.read_after(snapshot_sequence, records, replay, code, message)) {
     return std::nullopt;
   }
+  // Records are read back under exactly the bound they were written under, so
+  // any record that was accepted is a record that can be recovered.
 
   // Replay. The snapshot is materialised again by applying records in order; a
   // record that cannot be applied is a refusal to serve, never a silent skip.
   for (const ledger::Record& record : records) {
-    JsonDecodeResult decoded = json_decode(record.payload, JsonDecodeOptions{});
+    JsonDecodeResult decoded = json_decode(record.payload, journal_decode_options());
     if (!decoded.ok || !decoded.value.is_object()) {
       code = Code::kLedgerCorrupt;
       message = "journal record " + std::to_string(record.sequence) +
@@ -688,17 +702,15 @@ AttachEvidenceResult Runtime::attach_evidence(const EvidenceSet& submitted) {
   std::sort(affected.begin(), affected.end());
   affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
 
+  // The affected workloads are deliberately not written into the record. The set
+  // is a function of the evidence scopes and the registered contracts, both of
+  // which the record already carries, and recovery recomputes it from those. A
+  // stored copy would grow the record with the size of the state instead of the
+  // size of the submission.
   Json payload;
   payload.set("evidence", evidence_to_json(stamped));
   payload.set("publisher", stamped.publisher.str());
   payload.set("recorded_at_millis", static_cast<std::int64_t>(now_millis()));
-  if (!affected.empty()) {
-    JsonArray workloads;
-    for (const WorkloadId& id : affected) {
-      workloads.push_back(Json(id.str()));
-    }
-    payload.set("workloads", Json(std::move(workloads)));
-  }
 
   const CommitOutcome outcome = commit(ledger::RecordType::kEvidenceAttached, payload);
   if (!outcome.ok) {

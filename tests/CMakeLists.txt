@@ -22,6 +22,13 @@ add_executable(wnc_test_tool support/wnc_test_tool.cpp)
 target_link_libraries(wnc_test_tool PRIVATE wnc)
 wnc_apply_build_options(wnc_test_tool)
 
+# The scale suite reads the process working set, which on Windows lives in psapi.
+if(WIN32)
+  set(WNC_SCALE_EXTRA_LIBRARIES psapi)
+else()
+  set(WNC_SCALE_EXTRA_LIBRARIES "")
+endif()
+
 set(WNC_TEST_SOURCES
   "unit/test_core.cpp"
   "unit/test_json.cpp"
@@ -36,9 +43,13 @@ set(WNC_TEST_SOURCES
   "concurrency/test_concurrency.cpp"
   "protocol/test_protocol.cpp"
   "integration/test_integration.cpp"
-  "multiprocess/test_multiprocess.cpp")
+  "multiprocess/test_multiprocess.cpp"
+  "scale/test_scale.cpp")
 
 foreach(source IN LISTS WNC_TEST_SOURCES)
   get_filename_component(stem "${source}" NAME_WE)
   wnc_add_test_suite(wnc_${stem} "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+  if(stem STREQUAL "test_scale" AND WNC_SCALE_EXTRA_LIBRARIES)
+    target_link_libraries(wnc_${stem} PRIVATE ${WNC_SCALE_EXTRA_LIBRARIES})
+  endif()
 endforeach()

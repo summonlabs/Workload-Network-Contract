@@ -240,10 +240,11 @@ The state below is what the reference host actually produced, not a plan.
 | Protocol | `wnc_test_protocol` | pass |
 | Integration | `wnc_test_integration` | pass |
 | Multiprocess | `wnc_test_multiprocess` | 3/3 pass |
+| Scale | `wnc_test_scale` | 6/6 pass |
 
 ```
 $ ctest --test-dir build/dev
-100% tests passed, 0 tests failed out of 14
+100% tests passed, 0 tests failed out of 15
 ```
 
 Both `Debug` and `Release` configurations pass the same 14 suites with
@@ -280,6 +281,33 @@ Defects found and fixed during verification, each of which changed behaviour:
   violation that aborted the process after the test had already reported
   success. The test now binds both lists first.
 
+### Scale
+
+`wnc_test_scale` measures completed operations at 1 000 and 10 000 workloads
+against a real runtime with a real durable journal, and compares the
+per-operation cost between the two scales. A flat cost is a cost that scales; an
+O(N^2) path multiplies the ratio by the scale factor. Measured in `Debug`:
+
+| Measurement | 1 000 | 10 000 |
+|---|---|---|
+| Contract registration | 4 510 us each | 4 664 us each (ratio 1.03) |
+| Indexed lookup (`contract_at` + `snapshot`) | 7 us | 7 us (ratio 1.00) |
+| Journal bytes per record | 1 507 | 1 509 |
+| Resident bytes per workload | 4 608 | 3 834 |
+
+Evidence attachment costs 25 294 us per attach at 10 000 workloads and does not
+drift as attaches accumulate (last quarter / first quarter = 0.84), so the
+affected-workload scan is proportional to the state and not to the history.
+Evaluation completes for all 10 000 workloads at 12 us each, re-evaluation is
+cheaper than the first pass (ratio 0.75), and the verdicts are exactly the ones
+the data implies: 8 100 SATISFIED and 1 900 UNSATISFIED against an observed
+9 099, with **no verdict left UNKNOWN while current evidence covered it**.
+Composing 16 layers over 512 requirements yields 640 requirements in 43 ms with a
+repeat-cost ratio of 0.86. Reopening a journal of 10 000 workloads rebuilds the
+index in 633 us per record, `verify_history` agrees with it, and the first
+evaluation after the restart reports **UNKNOWN**, not a durable verdict served as
+current.
+
 Reproduce the closure proof from a clean tree:
 
 ```
@@ -303,7 +331,13 @@ ctest --test-dir build/dev --output-on-failure
 * **One coordinator instance owns a state directory.** Concurrency is handled by
   the single-threaded transport loop plus the directory lock, not by distributed
   consensus among coordinators.
-* **Sanitizer coverage is unavailable on the reference host.**
+* **Sanitizer coverage is UNSUPPORTED on the reference host.** MSVC 19.44
+  accepts `/fsanitize=address` for x64 but the x64 runtime is not installed:
+  linking fails with `LNK1104: cannot open file
+  'clang_rt.asan_static_runtime_thunk-x86_64.lib'`, because only the x86
+  sanitizer libraries are present under `VC\Tools\MSVC\14.44.35207\lib\x86`
+  and `bin\Host*\x86`. `clang-cl` is not installed either. No memory-safety
+  claim in this repository rests on sanitizer output.
 
 ## License
 

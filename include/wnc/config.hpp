@@ -45,8 +45,12 @@ inline constexpr std::size_t kMaxCompositionLayers = 16;
 // Persistence bounds
 // ---------------------------------------------------------------------------
 
-// Bytes of a single journal record payload.
-inline constexpr std::size_t kMaxRecordBytes = 1024 * 1024;
+// Bytes of a single journal record payload. A record is recovered by the same
+// runtime that wrote it, so the bound it is written under is the bound it is
+// read back under: if the write bound were larger than the decode bound, a
+// payload between the two would be accepted, acknowledged, and then make the
+// whole history unreadable. This is one symbol for exactly that reason.
+inline constexpr std::size_t kMaxRecordBytes = kMaxDocumentBytes;
 // Journal records retained in one chain file before rotation.
 inline constexpr std::size_t kMaxRecordsPerSegment = 4096;
 // Journal segment files retained in a ledger directory.
