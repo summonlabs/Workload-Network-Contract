@@ -178,6 +178,9 @@ std::string Diagnostic::render() const {
 void DiagnosticLog::add(const Diagnostic& diagnostic) {
   if (entries_.size() >= limit_) {
     truncated_ = true;
+    if (!diagnostic.ok() && dropped_error_ == Code::kOk) {
+      dropped_error_ = diagnostic.code;
+    }
     return;
   }
   entries_.push_back(diagnostic);
@@ -201,7 +204,7 @@ bool DiagnosticLog::has_errors() const noexcept {
       return true;
     }
   }
-  return false;
+  return dropped_error_ != Code::kOk;
 }
 
 std::vector<std::string> DiagnosticLog::reasons() const {
@@ -222,7 +225,7 @@ Code DiagnosticLog::first_error_code() const noexcept {
       return entry.code;
     }
   }
-  return Code::kOk;
+  return dropped_error_;
 }
 
 }  // namespace wnc

@@ -218,6 +218,13 @@ LockToken lock_directory(const std::filesystem::path& directory, Code& code, std
   HANDLE handle = ::CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
+    // The lock file is opened without sharing, so a holder is already visible
+    // here: its open handle is what makes this one fail.
+    if (::GetLastError() == ERROR_SHARING_VIOLATION) {
+      code = Code::kLockHeld;
+      message = "another live holder owns the state directory";
+      return nullptr;
+    }
     code = Code::kDirectoryUnavailable;
     message = "cannot open the state directory lock";
     return nullptr;

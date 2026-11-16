@@ -435,3 +435,328 @@ WNC_TEST(runtime, verify_history_accepts_a_consistent_index) {
   WNC_CHECK(runtime->verify_history(code, message));
   WNC_CHECK_EQ(code, Code::kOk);
 }
+
+namespace {
+
+// Canonicalises and signs a contract the proof has edited after building it.
+void seal(Contract& contract, const LocalSigner& signer, std::string_view domain) {
+  (void)canonicalize(contract);
+  contract.envelope.signature.clear();
+  const SignatureBytes signature =
+      sign_with_local_signer(signer, domain, contract_body_to_json(contract.body).dump());
+  contract.envelope.signature = signature.bytes;
+}
+
+// True when the state directory can be opened again, which is what a restart of
+// the coordinator needs.
+bool restarts(const Fixture& fixture, std::string& message) {
+  Code code = Code::kOk;
+  const std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+  if (!runtime.has_value()) {
+    message = std::string(code_token(code)) + ": " + message;
+  }
+  return runtime.has_value();
+}
+
+}  // namespace
+
+WNC_TEST(runtime, a_mutation_after_a_restart_keeps_the_journal_readable) {
+  Fixture fixture("chain-restart");
+  const Contract first = make_contract(fixture.signer, "trainer", 1, 1000.0);
+  const Contract second = make_contract(fixture.signer, "evaluator", 1, 2000.0);
+  const Contract third = make_contract(fixture.signer, "indexer", 1, 3000.0);
+  Code code = Code::kOk;
+  std::string message;
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    WNC_CHECK(runtime->register_workload(first).ok);
+  }
+  {
+    // The second boot appends to the journal the first boot left.
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    const RegisterResult registered = runtime->register_workload(second);
+    WNC_CHECK_MSG(registered.ok, registered.message);
+    WNC_CHECK_EQ(registered.sequence, std::uint64_t(2));
+    WNC_CHECK_MSG(runtime->verify_history(code, message),
+                  std::string(code_token(code)) + ": " + message);
+  }
+  {
+    // And the third boot can read what the second one acknowledged.
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), std::string(code_token(code)) + ": " + message);
+    WNC_CHECK(runtime->snapshot(first.body.workload.id).has_value());
+    WNC_CHECK(runtime->snapshot(second.body.workload.id).has_value());
+    WNC_CHECK(runtime->register_workload(third).ok);
+    WNC_CHECK_MSG(runtime->verify_history(code, message),
+                  std::string(code_token(code)) + ": " + message);
+  }
+  WNC_CHECK_MSG(restarts(fixture, message), message);
+}
+
+WNC_TEST(runtime, evidence_attached_from_a_decoded_document_survives_a_restart) {
+  Fixture fixture("evidence-document");
+  const Contract contract = make_contract(fixture.signer, "trainer", 1, 1000.0);
+  Code code = Code::kOk;
+  std::string message;
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    WNC_CHECK(runtime->register_workload(contract).ok);
+
+    // The form evidence has when a client sends it: a document, decoded. The
+    // decoder derives the identity of the document, so the set arrives with one.
+    const EvidenceDecodeResult document =
+        evidence_from_json(evidence_to_json(make_evidence(fixture.signer.publisher, 1, 5000.0)));
+    WNC_CHECK_MSG(document.ok, document.message);
+    WNC_CHECK(!document.evidence.evidence_id.is_zero());
+    const AttachEvidenceResult attached = runtime->attach_evidence(document.evidence);
+    WNC_CHECK_MSG(attached.ok, attached.message);
+    WNC_CHECK_EQ(runtime->evaluate(contract.body.workload.id).evaluation.aggregate,
+                 Satisfaction::kSatisfied);
+  }
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), std::string(code_token(code)) + ": " + message);
+    const EvaluationResult evaluated = runtime->evaluate(contract.body.workload.id);
+    WNC_CHECK(evaluated.ok);
+    WNC_CHECK_EQ(evaluated.evaluation.aggregate, Satisfaction::kUnknown);
+  }
+}
+
+WNC_TEST(runtime, evidence_whose_entries_carry_an_identity_survives_a_restart) {
+  Fixture fixture("evidence-entry-id");
+  const Contract contract = make_contract(fixture.signer, "trainer", 1, 1000.0);
+  const EvidenceId entry_id = EvidenceId::from_digest(sha256(std::string_view("probe-17")));
+  Code code = Code::kOk;
+  std::string message;
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    WNC_CHECK(runtime->register_workload(contract).ok);
+    EvidenceSet evidence = make_evidence(fixture.signer.publisher, 1, 5000.0);
+    evidence.entries.front().id = entry_id;
+    const AttachEvidenceResult attached = runtime->attach_evidence(evidence);
+    WNC_CHECK_MSG(attached.ok, attached.message);
+    // The verdict names the entry it was decided from.
+    const EvaluationResult evaluated = runtime->evaluate(contract.body.workload.id);
+    WNC_CHECK(evaluated.ok);
+    WNC_CHECK(evaluated.evaluation.requirements.front().evidence == entry_id);
+  }
+  WNC_CHECK_MSG(restarts(fixture, message), message);
+}
+
+WNC_TEST(runtime, attached_evidence_expires_with_age) {
+  Fixture fixture("evidence-age");
+  Runtime::Options options = fixture.options();
+  options.evidence_max_age_millis = 1000;
+  Code code = Code::kOk;
+  std::string message;
+  std::optional<Runtime> runtime = Runtime::open(options, code, message);
+  WNC_CHECK_MSG(runtime.has_value(), message);
+  const Contract contract = make_contract(fixture.signer, "trainer", 1, 1000.0);
+  WNC_CHECK(runtime->register_workload(contract).ok);
+
+  // An observation that was made a minute ago, under a bound of one second.
+  EvidenceSet old_evidence = make_evidence(fixture.signer.publisher, 1, 5000.0);
+  old_evidence.entries.front().produced_at_millis = state::wall_millis() - 60000;
+  const AttachEvidenceResult attached = runtime->attach_evidence(old_evidence);
+  WNC_CHECK_MSG(attached.ok, attached.message);
+
+  const EvaluationResult stale = runtime->evaluate(contract.body.workload.id);
+  WNC_CHECK(stale.ok);
+  WNC_CHECK_EQ(stale.evaluation.aggregate, Satisfaction::kUnknown);
+  WNC_CHECK_EQ(stale.evaluation.requirements.front().satisfaction, Satisfaction::kUnknown);
+  WNC_CHECK_EQ(stale.evaluation.requirements.front().reason_code, Code::kEvidenceExpired);
+
+  // A fresh observation of the same scope is current again.
+  const AttachEvidenceResult refreshed =
+      runtime->attach_evidence(make_evidence(fixture.signer.publisher, 2, 5000.0));
+  WNC_CHECK_MSG(refreshed.ok, refreshed.message);
+  const EvaluationResult current = runtime->evaluate(contract.body.workload.id);
+  WNC_CHECK(current.ok);
+  WNC_CHECK_EQ(current.evaluation.aggregate, Satisfaction::kSatisfied);
+}
+
+WNC_TEST(runtime, a_contract_recovery_would_refuse_is_refused_before_it_is_recorded) {
+  Fixture fixture("unreadable-contract");
+  Code code = Code::kOk;
+  std::string message;
+  bool accepted = false;
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    // A description longer than a contract document may carry. Nothing in the
+    // in-memory checks looks at it; the decoder that reads the journal does.
+    Contract contract = make_contract(fixture.signer, "trainer", 1, 1000.0);
+    contract.body.description = std::string(kMaxStringBytes + 1, 'd');
+    seal(contract, fixture.signer, "wnc/v1/submission/registration");
+    accepted = runtime->register_workload(contract).ok;
+  }
+  // Whatever was answered, the directory must still open.
+  WNC_CHECK_MSG(restarts(fixture, message), message);
+  WNC_CHECK(!accepted);
+}
+
+WNC_TEST(runtime, evidence_recovery_would_refuse_is_refused_before_it_is_recorded) {
+  Fixture fixture("unreadable-evidence");
+  Code code = Code::kOk;
+  std::string message;
+  bool accepted = false;
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    WNC_CHECK(runtime->register_workload(make_contract(fixture.signer, "trainer", 1, 1000.0)).ok);
+    // Generation zero is not a generation an evidence document may state.
+    accepted = runtime->attach_evidence(make_evidence(fixture.signer.publisher, 0, 5000.0)).ok;
+  }
+  WNC_CHECK_MSG(restarts(fixture, message), message);
+  WNC_CHECK(!accepted);
+}
+
+WNC_TEST(runtime, a_policy_recovery_would_refuse_is_refused_before_it_is_recorded) {
+  Fixture fixture("unreadable-policy");
+  Code code = Code::kOk;
+  std::string message;
+  bool accepted = false;
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    // A policy whose identity was never derived from its content.
+    Policy policy;
+    policy.schema_version = kSchemaVersion;
+    policy.generation.value = 1;
+    PolicyRule rule;
+    rule.kind = RequirementKind::kMinBandwidth;
+    rule.scope = "fabric";
+    rule.max_minimum = 4000.0;
+    rule.max_target = 4000.0;
+    policy.rules.push_back(rule);
+    accepted = runtime->install_policy(policy).ok;
+  }
+  WNC_CHECK_MSG(restarts(fixture, message), message);
+  WNC_CHECK(!accepted);
+}
+
+WNC_TEST(runtime, a_snapshot_does_not_hide_the_journal_records_below_it) {
+  Fixture fixture("snapshot-replay");
+  const Contract contract = make_contract(fixture.signer, "trainer", 1, 1000.0);
+  Code code = Code::kOk;
+  std::string message;
+  CoordinatorId coordinator{};
+  Digest trust_digest{};
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    WNC_CHECK(runtime->register_workload(contract).ok);
+    coordinator = runtime->info().coordinator;
+    trust_digest = runtime->info().trust_digest;
+  }
+  {
+    // A derived index written at the journal's last sequence, the only kind the
+    // ledger accepts.
+    ledger::RecoveryReport recovery;
+    std::optional<ledger::Ledger> ledger = ledger::Ledger::open(
+        fixture.directory, coordinator, trust_digest, recovery, code, message);
+    WNC_CHECK_MSG(ledger.has_value(), message);
+    ledger::Ledger::Snapshot snapshot;
+    snapshot.epoch = ledger->head().epoch;
+    snapshot.sequence = ledger->last_sequence();
+    snapshot.payload = "{}";
+    WNC_CHECK_MSG(ledger->write_snapshot(snapshot, code, message), message);
+  }
+  std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+  WNC_CHECK_MSG(runtime.has_value(), message);
+  // The index is not an authority: the workload the journal records is still
+  // registered, and it cannot be registered a second time.
+  WNC_CHECK(runtime->snapshot(contract.body.workload.id).has_value());
+  const RegisterResult again = runtime->register_workload(contract);
+  WNC_CHECK(!again.ok);
+  WNC_CHECK_EQ(again.code, Code::kDuplicateWorkload);
+}
+
+WNC_TEST(runtime, a_retired_workload_stays_retired_in_its_history_after_a_restart) {
+  Fixture fixture("retire-restart");
+  const Contract contract = make_contract(fixture.signer, "trainer", 1, 1000.0);
+  Code code = Code::kOk;
+  std::string message;
+  {
+    std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+    WNC_CHECK_MSG(runtime.has_value(), message);
+    WNC_CHECK(runtime->register_workload(contract).ok);
+    WNC_CHECK(runtime->retire(contract.body.workload.id).ok);
+    const std::optional<WorkloadSnapshot> live = runtime->snapshot(contract.body.workload.id);
+    WNC_CHECK(live.has_value());
+    WNC_CHECK(live->history.back().retired);
+  }
+  std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+  WNC_CHECK_MSG(runtime.has_value(), message);
+  const std::optional<WorkloadSnapshot> restored = runtime->snapshot(contract.body.workload.id);
+  WNC_CHECK(restored.has_value());
+  WNC_CHECK(restored->retired);
+  WNC_CHECK(restored->history.back().retired);
+}
+
+WNC_TEST(runtime, a_policy_without_rules_constrains_nothing) {
+  Fixture fixture("empty-policy");
+  Code code = Code::kOk;
+  std::string message;
+  std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+  WNC_CHECK_MSG(runtime.has_value(), message);
+
+  Policy policy;
+  policy.schema_version = kSchemaVersion;
+  policy.generation.value = 1;
+  policy.policy_id = derive_policy_id(policy_digest(policy));
+  const RuntimePolicyResult installed = runtime->install_policy(policy);
+  WNC_CHECK_MSG(installed.ok, installed.message);
+
+  const RegisterResult registered =
+      runtime->register_workload(make_contract(fixture.signer, "trainer", 1, 1000.0));
+  WNC_CHECK_MSG(registered.ok,
+                std::string(code_token(registered.code)) + ": " + registered.message);
+}
+
+WNC_TEST(runtime, a_policy_violation_is_not_lost_among_unconstrained_requirements) {
+  Fixture fixture("policy-flood");
+  Code code = Code::kOk;
+  std::string message;
+  std::optional<Runtime> runtime = Runtime::open(fixture.options(), code, message);
+  WNC_CHECK_MSG(runtime.has_value(), message);
+
+  // The operator permits at most 4000 of bandwidth in the fabric scope.
+  Policy policy;
+  policy.schema_version = kSchemaVersion;
+  policy.generation.value = 1;
+  PolicyRule rule;
+  rule.kind = RequirementKind::kMinBandwidth;
+  rule.scope = "fabric";
+  rule.max_minimum = 4000.0;
+  rule.max_target = 4000.0;
+  policy.rules.push_back(rule);
+  policy.policy_id = derive_policy_id(policy_digest(policy));
+  WNC_CHECK(runtime->install_policy(policy).ok);
+
+  // A contract that asks for 9000 there, after a long run of requirements no
+  // rule speaks about. Those sort ahead of the one that violates the policy.
+  Contract contract = make_contract(fixture.signer, "trainer", 1, 9000.0);
+  Scope annotations;
+  annotations.name = "annotations";
+  contract.body.scopes.push_back(annotations);
+  for (int index = 0; index < 100; ++index) {
+    Requirement note;
+    note.scope = "annotations";
+    note.kind = RequirementKind::kAttribute;
+    note.strength = RequirementStrength::kInformational;
+    note.key = "label-" + std::to_string(index);
+    note.value = "set";
+    contract.body.requirements.push_back(note);
+  }
+  seal(contract, fixture.signer, "wnc/v1/submission/registration");
+
+  const RegisterResult refused = runtime->register_workload(contract);
+  WNC_CHECK(!refused.ok);
+  WNC_CHECK_EQ(refused.code, Code::kPolicyDenied);
+  WNC_CHECK(!runtime->snapshot(contract.body.workload.id).has_value());
+}

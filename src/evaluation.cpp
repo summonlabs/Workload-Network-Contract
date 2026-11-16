@@ -477,6 +477,25 @@ EvidenceDecodeResult evidence_from_json(const Json& value) {
     }
     entry.scope = scope->as_string();
 
+    // The entry identity is part of the bytes the evidence identity covers, so
+    // it is decoded as written. Dropping it would make a document that states
+    // one disagree with its own identity when it is read back.
+    const Json* entry_id = member(entry_object, "id");
+    if (entry_id != nullptr) {
+      if (!entry_id->is_string()) {
+        result.code = Code::kJsonWrongType;
+        result.message = "evidence entry id must be a string";
+        return result;
+      }
+      const std::optional<EvidenceId> parsed = EvidenceId::parse(entry_id->as_string());
+      if (!parsed.has_value()) {
+        result.code = Code::kJsonWrongType;
+        result.message = "evidence entry id must be a 64 character identifier";
+        return result;
+      }
+      entry.id = *parsed;
+    }
+
     const Json* entry_generation = member(entry_object, "generation");
     if (entry_generation != nullptr) {
       if (!entry_generation->is_int() || entry_generation->as_int() < 0) {

@@ -351,12 +351,9 @@ bool value_allowed(const PolicyRule& rule, const std::string& value) {
 
 PolicyValidationResult check_contract_against_policy(const Policy& policy, const ContractBody& body) {
   PolicyValidationResult result;
-  if (policy.rules.empty()) {
-    // An empty policy constrains nothing; it does not silently allow everything
-    // either. The distinction is recorded in the diagnostics of an install.
-    return result;
-  }
-
+  // A policy without rules constrains nothing, so every requirement is permitted
+  // by it. That is not silent: each one is noted below as unconstrained, the
+  // same way a requirement no rule matches is noted under any other policy.
   for (const Requirement& requirement : body.requirements) {
     bool matched = false;
     for (const PolicyRule& rule : policy.rules) {

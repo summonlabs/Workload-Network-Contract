@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -204,6 +205,9 @@ class Ledger {
   std::uint64_t segment_count_ = 0;
   std::uint64_t retained_bytes_ = 0;
   bool open_ = false;
+  // The exclusive lock on the state directory, held for the life of the ledger
+  // and released with it.
+  std::shared_ptr<void> lock_;
 };
 
 // Builds the byte string for one frame. Exposed for adversarial tests.

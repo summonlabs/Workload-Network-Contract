@@ -214,13 +214,19 @@ bool parse_frame(std::string_view bytes, std::size_t offset, Record& record, std
     message = "frame payload digest does not match its bytes";
     return false;
   }
-  // The header carries the link to the previous record at 56. It is surfaced as
-  // the record's chain value because the chain a caller needs to compare against
-  // is the previous record's, and the zeroed-prefix digest of this record is
-  // recomputed by the reader rather than read from the file. Every byte of the
-  // header is therefore covered by either the CRC or that recomputation, which is
-  // what makes a doctored link detectable.
-  std::memcpy(record.chain.data(), header + 56, record.chain.size());
+  // The header carries the link to the previous record at 56. This record's own
+  // chain value is not stored: it is recomputed here from the first 88 header
+  // bytes with the link field zeroed, followed by the payload. The two are kept
+  // apart, because the next record has to link to this record's own value and
+  // not to the link this record carries.
+  std::memcpy(record.previous_chain.data(), header + 56, record.previous_chain.size());
+  std::array<char, 88> prefix{};
+  std::memcpy(prefix.data(), header, prefix.size());
+  for (std::size_t i = 56; i < 88; ++i) {
+    prefix[i] = '\0';
+  }
+  record.chain = chain_of(std::string_view(prefix.data(), prefix.size()),
+                          std::string_view(record.payload));
   consumed = total;
   return true;
 }
@@ -247,6 +253,23 @@ std::optional<Ledger> Ledger::open(const std::filesystem::path& directory,
     code = Code::kPathRejected;
     message = "state paths resolve outside the state directory";
     return std::nullopt;
+  }
+
+  // A state directory has one live owner. Everything below reads and rewrites
+  // it - the head is advanced, a torn tail is cut - and every later append
+  // continues this ledger's own sequence and chain, so a second holder would
+  // interleave records the journal can never be read back through. The lock is
+  // taken before anything is read and is held for as long as the ledger is.
+  {
+    Code lock_code = Code::kOk;
+    std::string lock_message;
+    const state::LockToken token = state::lock_directory(directory, lock_code, lock_message);
+    if (token == nullptr) {
+      code = lock_code;
+      message = lock_message;
+      return std::nullopt;
+    }
+    ledger.lock_ = std::shared_ptr<void>(token, [](void* held) { state::unlock_directory(held); });
   }
 
   bool head_present = false;
@@ -602,25 +625,16 @@ bool Ledger::read_frames(std::vector<Record>& records, RecoveryReport& report, b
         message = report.detail;
         return false;
       }
-      // Recompute this record's chain value from the bytes on disk: the first 88
-      // header bytes with the link field zeroed, followed by the payload. A
-      // doctored field, a doctored payload, or a moved record all break it.
-      std::array<char, 88> prefix{};
-      std::memcpy(prefix.data(), bytes.data() + offset, prefix.size());
-      for (std::size_t i = 56; i < 88; ++i) {
-        prefix[i] = '\0';
-      }
-      const Digest derived = chain_of(std::string_view(prefix.data(), prefix.size()),
-                                      std::string_view(record.payload));
-      // Continuity: the link field, which parse_frame surfaced as record.chain,
-      // must equal the running chain. A removed, duplicated, reordered, or
-      // doctored link breaks the chain here.
-      if (record.chain != previous_chain) {
+      // Continuity: the link this record carries must equal the chain value of
+      // the record before it, which parse_frame recomputed from the bytes on
+      // disk. A removed, duplicated, reordered, or doctored record breaks the
+      // chain here.
+      if (record.previous_chain != previous_chain) {
         code = Code::kLedgerCorrupt;
         message = "journal record does not link to the previous record";
         return false;
       }
-      previous_chain = derived;
+      previous_chain = record.chain;
       (void)first_record;
       expected_sequence = record.sequence + 1;
       report.last_valid_sequence = record.sequence;

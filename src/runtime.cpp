@@ -67,6 +67,80 @@ JsonDecodeOptions journal_decode_options() {
   return options;
 }
 
+// What recovery does to a record before it applies it. Recovery reads every
+// record back with these decoders, and one record that any of them refuses
+// makes the whole directory unreadable from then on. The decoders are stricter
+// than the in-memory checks a submission passes: they bound every text, they
+// require the identities a document states to match its bytes, and they refuse
+// numbers and generations the checks never look at. So a record is put through
+// them before it is appended, and one that could not be read back is refused
+// while refusing it is still harmless.
+bool record_can_be_recovered(ledger::RecordType type, std::string_view bytes, Code& code,
+                             std::string& message) {
+  const JsonDecodeResult decoded = json_decode(bytes, journal_decode_options());
+  if (!decoded.ok) {
+    code = decoded.code;
+    message = "the record could not be read back: " + decoded.message;
+    return false;
+  }
+  if (!decoded.value.is_object()) {
+    code = Code::kJsonNotAnObject;
+    message = "the record could not be read back: it is not a JSON object";
+    return false;
+  }
+  const Json& payload = decoded.value;
+  switch (type) {
+    case ledger::RecordType::kWorkloadRegistered:
+    case ledger::RecordType::kContractPublished: {
+      const Json* document = payload.find("contract");
+      if (document == nullptr) {
+        code = Code::kJsonMissingField;
+        message = "the record carries no contract";
+        return false;
+      }
+      const ContractDecodeResult contract = contract_from_json(*document);
+      if (!contract.ok) {
+        code = contract.code;
+        message = "the contract could not be read back from its record: " + contract.message;
+        return false;
+      }
+      return true;
+    }
+    case ledger::RecordType::kEvidenceAttached: {
+      const Json* document = payload.find("evidence");
+      if (document == nullptr) {
+        code = Code::kJsonMissingField;
+        message = "the record carries no evidence";
+        return false;
+      }
+      const EvidenceDecodeResult evidence = evidence_from_json(*document);
+      if (!evidence.ok) {
+        code = evidence.code;
+        message = "the evidence could not be read back from its record: " + evidence.message;
+        return false;
+      }
+      return true;
+    }
+    case ledger::RecordType::kPolicyInstalled: {
+      const Json* document = payload.find("policy");
+      if (document == nullptr) {
+        code = Code::kJsonMissingField;
+        message = "the record carries no policy";
+        return false;
+      }
+      const PolicyDecodeResult policy = policy_from_json(*document);
+      if (!policy.ok) {
+        code = policy.code;
+        message = "the policy could not be read back from its record: " + policy.message;
+        return false;
+      }
+      return true;
+    }
+    default:
+      return true;
+  }
+}
+
 }  // namespace
 
 Runtime::~Runtime() = default;
@@ -112,35 +186,29 @@ std::optional<Runtime> Runtime::open(const Options& options, Code& code, std::st
   runtime.info_.recovered_records = recovery.valid_records;
   runtime.info_.truncated_bytes = recovery.truncated_bytes;
 
-  // Load the derived snapshot (never authority) and replay the journal above it.
-  std::uint64_t snapshot_sequence = 0;
+  // The snapshot is a derived index and never an authority. One that is ahead of
+  // the journal is refused; any other is not a starting point either, because
+  // this runtime does not rebuild state from a snapshot: starting the replay
+  // above it would drop every workload the skipped records describe. The
+  // journal is replayed from its first record.
   {
     ledger::Ledger::Snapshot snapshot;
     bool present = false;
     if (!runtime.ledger_.read_snapshot(snapshot, present, code, message)) {
       return std::nullopt;
     }
-    if (present) {
-      const bool usable = snapshot.sequence <= runtime.ledger_.last_sequence();
-      if (!usable) {
-        // A snapshot ahead of the journal claims states the journal cannot back;
-        // it is discarded and the directory is reported as needing recovery.
-        code = Code::kRecoveryRequired;
-        message = "snapshot is ahead of the durable journal sequence";
-        return std::nullopt;
-      }
-      JsonDecodeResult decoded = json_decode(snapshot.payload, JsonDecodeOptions{});
-      if (decoded.ok && decoded.value.is_object()) {
-        snapshot_sequence = snapshot.sequence;
-      } else {
-        snapshot_sequence = 0;
-      }
+    if (present && snapshot.sequence > runtime.ledger_.last_sequence()) {
+      // A snapshot ahead of the journal claims states the journal cannot back;
+      // it is discarded and the directory is reported as needing recovery.
+      code = Code::kRecoveryRequired;
+      message = "snapshot is ahead of the durable journal sequence";
+      return std::nullopt;
     }
   }
 
   std::vector<ledger::Record> records;
   ledger::RecoveryReport replay;
-  if (!runtime.ledger_.read_after(snapshot_sequence, records, replay, code, message)) {
+  if (!runtime.ledger_.read_all(records, replay, code, message)) {
     return std::nullopt;
   }
   // Records are read back under exactly the bound they were written under, so
@@ -226,6 +294,10 @@ std::optional<Runtime> Runtime::open(const Options& options, Code& code, std::st
           return std::nullopt;
         }
         found->second.retired = true;
+        // The same marks retirement leaves on a live runtime.
+        for (GenerationRecord& generation : found->second.generations) {
+          generation.retired = true;
+        }
         break;
       }
       case ledger::RecordType::kEvidenceAttached: {
@@ -365,6 +437,9 @@ Runtime::CommitOutcome Runtime::commit(ledger::RecordType type, const Json& payl
   if (bytes.size() > kMaxRecordBytes) {
     outcome.code = Code::kLedgerOversized;
     outcome.message = "record payload exceeds the configured bound";
+    return outcome;
+  }
+  if (!record_can_be_recovered(type, bytes, outcome.code, outcome.message)) {
     return outcome;
   }
   std::uint64_t sequence = 0;
@@ -680,7 +755,12 @@ AttachEvidenceResult Runtime::attach_evidence(const EvidenceSet& submitted) {
   // The identity is derived from the stamped bytes, so it has to be computed
   // after every field that participates in the digest has been written. Deriving
   // it earlier would stamp a set whose identity does not describe it, and the
-  // durable record would then be refused on the next recovery.
+  // durable record would then be refused on the next recovery. The identity
+  // field is itself one of those bytes: it is cleared first, as the decoder
+  // derives the identity of a document with the field not yet stated. A set
+  // that arrives decoded already carries an identity, and deriving the new one
+  // over it would produce a value no reader can reproduce.
+  stamped.evidence_id = EvidenceId{};
   stamped.evidence_id = derive_evidence_id(evidence_digest(stamped));
 
   // Workloads are affected in a deterministic order so that two identical
@@ -902,6 +982,17 @@ EvaluationResult Runtime::evaluate_internal(const WorkloadState& workload, const
     }
   } else if (workload.evidence.has_value()) {
     evidence = *workload.evidence;
+    // Attached evidence ages. An entry was current when it was attached; it
+    // stops being current once it is older than the permitted age, exactly as a
+    // supplied entry of that age would be found expired.
+    const std::uint64_t now = now_millis();
+    for (EvidenceEntry& entry : evidence.entries) {
+      if (entry.freshness == EvidenceFreshness::kCurrent && evidence_max_age_millis_ > 0 &&
+          now > entry.produced_at_millis &&
+          now - entry.produced_at_millis > evidence_max_age_millis_) {
+        entry.freshness = EvidenceFreshness::kExpired;
+      }
+    }
   } else {
     // No evidence has ever been supplied for this workload. The verdict is
     // unknown, never satisfied, and the contract digest is still reported so a

@@ -199,6 +199,10 @@ class DiagnosticLog {
   std::vector<Diagnostic> entries_;
   std::size_t limit_;
   bool truncated_ = false;
+  // The first error that arrived after the bound was reached. The bound limits
+  // what is reported, never what is decided: an error that could not be kept is
+  // still an error.
+  Code dropped_error_ = Code::kOk;
 };
 
 using Reasons = std::vector<std::string>;

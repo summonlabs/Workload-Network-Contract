@@ -128,21 +128,35 @@ WNC_TEST(concurrency, a_live_runtime_owns_its_state_directory) {
   std::optional<Runtime> first = Runtime::open(options, code, message);
   WNC_CHECK_MSG(first.has_value(), message);
 
-  // The directory lock is the cross-process exclusion. A second holder in the
-  // same process is allowed, because the transport and the runtime, not the file
-  // lock, serialise work inside one process; the lock is what stops a second
-  // process from writing into the same journal.
+  WNC_CHECK_EQ(first->info().epoch, std::uint64_t(1));
+
+  // The directory lock is the exclusion between holders. While one runtime is
+  // live nothing else may open the directory: a second writer would append to
+  // the same journal with a sequence and a chain of its own, and neither of
+  // them could read the result back.
+  Code second_code = Code::kOk;
+  std::string second_message;
+  const std::optional<Runtime> second = Runtime::open(options, second_code, second_message);
+  WNC_CHECK(!second.has_value());
+  WNC_CHECK_EQ(second_code, Code::kLockHeld);
+
   Code lock_code = Code::kOk;
   std::string lock_message;
   const state::LockToken token = state::lock_directory(guard.path, lock_code, lock_message);
-  WNC_CHECK(token != nullptr);
-  state::unlock_directory(token);
+  WNC_CHECK(token == nullptr);
+  WNC_CHECK_EQ(lock_code, Code::kLockHeld);
 
   // Dropping the runtime releases its lock without leaking the handle.
   first.reset();
-  const state::LockToken second = state::lock_directory(guard.path, lock_code, lock_message);
-  WNC_CHECK(second != nullptr);
-  state::unlock_directory(second);
+  const state::LockToken released = state::lock_directory(guard.path, lock_code, lock_message);
+  WNC_CHECK(released != nullptr);
+  state::unlock_directory(released);
+
+  // The refused attempt left the directory as it was: the next boot is the
+  // second one, not the third.
+  std::optional<Runtime> reopened = Runtime::open(options, code, message);
+  WNC_CHECK_MSG(reopened.has_value(), message);
+  WNC_CHECK_EQ(reopened->info().epoch, std::uint64_t(2));
 }
 
 WNC_TEST(concurrency, repeated_start_stop_cycles_leave_no_leaked_state) {
